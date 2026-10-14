@@ -1,0 +1,19 @@
+# macOS / Office lock & junk files
+.DS_Store
+~$*.pptx
+~$*.docx
+
+# compiled binaries (built on demand by the run_*.sh scripts / Docker)
+cache_timing/cache_timing
+rust_demo/ce
+rust_demo/server
+server_protected
+server_unprotected
+server_safe
+server_gdb
+*.o
+*.out
+
+# node / npm
+node_modules/
+.npmcache/

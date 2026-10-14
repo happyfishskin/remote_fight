@@ -1,0 +1,276 @@
+===============================================================================
+ Remote Buffer Overflow - How It Works  /  遠端緩衝區溢位原理說明
+ (Educational demo, sandboxed / 教學用,沙箱隔離)
+===============================================================================
+
+-------------------------------------------------------------------------------
+1. OVERVIEW / 總覽
+-------------------------------------------------------------------------------
+EN: A buffer overflow happens when a program writes more data into a fixed-size
+    memory region (a "buffer") than it can hold. The extra bytes spill over and
+    overwrite whatever sits next to the buffer in memory. On the call stack,
+    one of the things sitting next to a local buffer is the function's RETURN
+    ADDRESS - the location the CPU jumps to when the function finishes. Corrupt
+    that, and you corrupt the program's control flow.
+
+ZH: 緩衝區溢位發生在程式把超過固定大小記憶體區塊(緩衝區)容量的資料寫入其中。
+    多出來的位元組會溢出,覆寫記憶體中緊鄰緩衝區的內容。在呼叫堆疊上,緊鄰區域
+    局部緩衝區的其中一項就是函式的「回傳位址」——CPU 在函式結束時要跳回去的位置。
+    一旦它被破壞,程式的控制流程也隨之被破壞。
+
+-------------------------------------------------------------------------------
+2. WHY "REMOTE" / 為什麼是「遠端」
+-------------------------------------------------------------------------------
+EN: A remote overflow adds a network layer on top of the classic bug:
+    - The server runs a socket service, listening on a port (here: 8888).
+    - It reads incoming packet data into a fixed-size buffer.
+    - Because the copy is unbounded, an oversized packet overflows the buffer.
+    The attacker never touches the machine directly - the overlong input
+    arrives over the network.
+
+ZH: 遠端溢位是在傳統漏洞之上多了一層網路:
+    - 伺服器執行一個 Socket 服務,監聽某個 Port(本例:8888)。
+    - 它把傳入的封包資料讀進一個固定大小的緩衝區。
+    - 由於複製沒有邊界檢查,超長封包就會把緩衝區塞爆。
+    攻擊者完全不用碰到那台機器——超長輸入是透過網路送達的。
+
+-------------------------------------------------------------------------------
+3. THE VULNERABILITY IN THIS DEMO / 本 Demo 的漏洞
+-------------------------------------------------------------------------------
+EN: In server.c the request handler holds a 64-byte buffer on the stack:
+
+        char buffer[64];
+        strcpy(buffer, input);   // no length check -> overflow
+
+    strcpy() copies until it hits a NUL byte, with no regard for the size of
+    the destination. Send more than 64 bytes and it writes past the buffer,
+    over the saved stack data (including the return address).
+
+ZH: 在 server.c 中,請求處理函式在堆疊上放了一個 64 bytes 的緩衝區:
+
+        char buffer[64];
+        strcpy(buffer, input);   // 沒有長度檢查 -> 溢位
+
+    strcpy() 會一直複製到遇見 NUL 位元組為止,完全不管目的地的大小。送出超過
+    64 bytes,它就會越過緩衝區,覆寫已儲存的堆疊資料(包含回傳位址)。
+
+-------------------------------------------------------------------------------
+4. STACK LAYOUT / 堆疊配置示意
+-------------------------------------------------------------------------------
+    higher addresses / 高位址
+    +---------------------------+
+    |   saved return address    |  <- overwritten by the overflow
+    |   回傳位址(被覆寫)       |
+    +---------------------------+
+    |   saved frame pointer     |
+    +---------------------------+
+    |                           |
+    |   char buffer[64]         |  <- strcpy writes here, then keeps going up
+    |   (64-byte buffer)        |
+    |                           |
+    +---------------------------+
+    lower addresses / 低位址
+
+EN: Writing "AAAA...." (200 bytes) fills the 64-byte buffer and keeps going,
+    smashing the frame pointer and the return address above it.
+ZH: 寫入 200 bytes 的 "AAAA...." 會填滿 64 bytes 緩衝區後繼續往上,
+    把上方的 frame pointer 與回傳位址一起打爛。
+
+-------------------------------------------------------------------------------
+5. WHAT ACTUALLY HAPPENS / 實際結果
+-------------------------------------------------------------------------------
+EN: On a modern OS, overwriting the return address does NOT magically run
+    attacker code. Defenses step in and the usual result is a crash:
+
+    (a) Stack Canary ON  (gcc -fstack-protector-all)
+        A random "canary" value is placed just before the return address.
+        Before returning, the function checks it. If the overflow changed it,
+        the program prints "*** stack smashing detected ***" and ABORTS
+        on purpose.  -> exit code 134 (SIGABRT)
+
+    (b) Stack Canary OFF (gcc -fno-stack-protector)
+        No guard value. The return address is silently corrupted; when the
+        function returns the CPU jumps to an invalid address and the OS kills
+        the process.  -> exit code 139 (SIGSEGV / Segmentation fault)
+
+    Either way the server process dies and stops serving - a remote crash,
+    i.e. a Denial of Service (DoS).
+
+ZH: 在現代作業系統上,覆寫回傳位址並不會神奇地執行攻擊者的程式碼。防禦機制會介入,
+    最常見的結果是崩潰:
+
+    (a) Stack Canary 開啟 (gcc -fstack-protector-all)
+        在回傳位址前面放一個隨機的「金絲雀」值。函式返回前會檢查它,若被溢位改掉,
+        程式會印出 "*** stack smashing detected ***" 並「主動中止」。
+        -> 離開碼 134 (SIGABRT)
+
+    (b) Stack Canary 關閉 (gcc -fno-stack-protector)
+        沒有守衛值。回傳位址被無聲破壞;函式返回時 CPU 跳到無效位址,
+        作業系統直接終止該行程。
+        -> 離開碼 139 (SIGSEGV / Segmentation fault)
+
+    兩種情況下,伺服器行程都會死掉、停止服務——這就是遠端崩潰,也就是阻斷服務 (DoS)。
+
+-------------------------------------------------------------------------------
+6. MODERN DEFENSES / 現代防護機制
+-------------------------------------------------------------------------------
+EN:
+  - Stack Canary : a guard value checked on return; detects stack tampering.
+  - ASLR         : randomizes memory addresses so attackers cannot predict
+                   where code/data lives.
+  - DEP / NX     : marks the stack non-executable, so even injected bytes on
+                   the stack cannot be run as code.
+  Combined, these make the straightforward outcome of an un-bypassed overflow
+  a crash (DoS), rather than control-flow hijacking.
+
+ZH:
+  - Stack Canary(金絲雀): 返回時檢查的守衛值;偵測堆疊竄改。
+  - ASLR(位址隨機化)   : 隨機化記憶體位址,讓攻擊者無法預測程式碼/資料的位置。
+  - DEP / NX(不可執行)  : 把堆疊標記為不可執行,即使把位元組注入堆疊也無法當程式碼執行。
+  三者合力,使「未被繞過」的溢位最直接的結果是崩潰 (DoS),而非控制流劫持。
+
+-------------------------------------------------------------------------------
+7. THE KEY TAKEAWAY / 核心重點
+-------------------------------------------------------------------------------
+EN: The exit codes tell the whole story:
+      134 (SIGABRT) = the canary caught the tampering and shut things down
+                      cleanly BEFORE the bad return address could be used.
+      139 (SIGSEGV) = no canary; the corruption led to an uncontrolled fault.
+    "Protected" and "unprotected" both crash - the difference is a controlled
+    abort versus an uncontrolled memory fault.
+
+ZH: 離開碼道盡一切:
+      134 (SIGABRT) = 金絲雀在壞的回傳位址被用到「之前」就抓到竄改並乾淨地關閉。
+      139 (SIGSEGV) = 沒有金絲雀;破壞導致不受控的錯誤。
+    「有保護」與「無保護」都會崩潰——差別在於「主動中止」對上「不受控的記憶體錯誤」。
+
+-------------------------------------------------------------------------------
+8. THE FIX — SECURE CODING / 根治:安全的程式寫法
+-------------------------------------------------------------------------------
+EN: Protections (canary, ASLR, DEP/NX) are the last wall - they turn the bug
+    into a crash. The real cure is to stop the overflow from happening at all,
+    by bounding the copy:
+
+        char buffer[64];
+        strncpy(buffer, input, sizeof(buffer) - 1);  // copy at most 63 bytes
+        buffer[sizeof(buffer) - 1] = '\0';            // always NUL-terminate
+
+    Sending the SAME 200-byte payload to this fixed server:
+      - The input is truncated to 63 bytes (it fits the buffer).
+      - Nothing is written out of bounds; the stack is intact.
+      - The server replies "OK (safe)" and keeps running - no crash.
+    Compare: the strcpy server dies with exit 139; the strncpy server survives.
+
+ZH: 防護機制(金絲雀、ASLR、DEP/NX)是最後一道牆 —— 它們把漏洞變成崩潰。真正的
+    根治是讓溢位根本不會發生,也就是把複製加上長度上限:
+
+        char buffer[64];
+        strncpy(buffer, input, sizeof(buffer) - 1);  // 最多複製 63 bytes
+        buffer[sizeof(buffer) - 1] = '\0';            // 一定補上結尾 NUL
+
+    把「同一份」200-byte payload 送給修好的伺服器:
+      - 輸入被截斷成 63 bytes(剛好放得進緩衝區)。
+      - 完全沒有寫出界,堆疊保持完整。
+      - 伺服器回 "OK (safe)" 並繼續運行 —— 不崩潰。
+    對照:strcpy 版以 exit 139 死掉;strncpy 版安然存活。
+
+-------------------------------------------------------------------------------
+9. MEMORY-SAFE LANGUAGES (RUST) / 記憶體安全語言(Rust)
+-------------------------------------------------------------------------------
+EN: strncpy fixes one line; a memory-safe language prevents the WHOLE bug class.
+    In Rust the same overflow idea is stopped on two fronts, with no `unsafe`:
+
+      Compile time (constant out-of-bounds index):
+        let buffer = [0u8; 64];
+        let x = buffer[200];      // rustc ERROR: index out of bounds
+                                  // (#[deny(unconditional_panic)]) -> NO binary
+
+      Runtime (dynamic oversized copy):
+        buffer[..input.len()].copy_from_slice(input);
+        // if input.len() > 64 -> a SAFE panic ("range end index out of range"),
+        // exit 101, with NO memory corruption.
+
+    So Rust turns the bug into either a compile error or a controlled abort -
+    never the silent, exploitable stack smash C allows. Note: what stops the
+    overflow is Rust's BOUNDS CHECK, not the borrow checker (the borrow checker
+    handles lifetimes / aliasing: use-after-free, data races). This is why
+    Microsoft, Google (Android) and the Linux kernel are adopting Rust.
+
+ZH: strncpy 修的是一行;記憶體安全語言則根絕「整類」漏洞。在 Rust 裡,同樣的溢位
+    想法會在兩個時間點被擋下,而且不需要 `unsafe`:
+
+      編譯期(常數越界索引):
+        let buffer = [0u8; 64];
+        let x = buffer[200];      // rustc 錯誤:index out of bounds
+                                  // (#[deny(unconditional_panic)]) -> 不產出 binary
+
+      執行期(動態超量複製):
+        buffer[..input.len()].copy_from_slice(input);
+        // 若 input.len() > 64 -> 安全 panic(range end index out of range),
+        // 離開碼 101,且沒有任何記憶體破壞。
+
+    所以 Rust 把漏洞變成「編譯錯誤」或「受控中止」,絕不會是 C 那種靜默、可被利用
+    的堆疊破壞。注意:阻止溢位的是 Rust 的「邊界檢查」,不是借用檢查器(borrow
+    checker 管的是 lifetime / aliasing:use-after-free、資料競爭)。這正是
+    Microsoft、Google(Android)、Linux kernel 採用 Rust 的原因。
+
+-------------------------------------------------------------------------------
+10. CACHE TIMING SIDE-CHANNEL (FLUSH+RELOAD) / 快取計時側信道
+-------------------------------------------------------------------------------
+EN: A different attack class entirely: the attacker reads no secret memory and
+    crashes nothing. It exploits a microarchitectural fact - a CPU cache hit is
+    far faster than a DRAM miss - to infer data from timing alone. This is the
+    Flush+Reload primitive at the core of Spectre / Meltdown.
+
+    How it works:
+      1. Flush  - evict a probe array from the cache (so every slot is in DRAM).
+      2. Victim - the victim accesses probe[secret]; only that slot is now cached.
+      3. Reload - the attacker times access to every slot; the FASTEST one (a
+                  cache hit) reveals `secret`. No secret byte is ever read.
+
+    Measured natively on Apple Silicon (this project):
+      HIT  (L1/L2 cache) ~  0.9 ns / access
+      MISS (DRAM)        ~ 81   ns / access   (~90x slower)
+      -> the secret index is recovered correctly, every run, reading 0 secret bytes.
+
+    Practical notes: the userspace timer here is coarse (~41.67 ns/tick) with no
+    cycle counter, so each measurement times a BATCH of dependent pointer-chasing
+    loads to amortise granularity and defeat prefetch. A large eviction buffer
+    must be touched first (zero-page COW would otherwise evict nothing). Cache
+    timing does NOT reproduce under emulation (Rosetta/QEMU) - it must run native.
+
+    Takeaway: you do NOT need memory corruption to steal data. The CPU's
+    microarchitecture itself is an attack surface.
+
+ZH: 一種完全不同的攻擊類別:攻擊者不讀任何敏感記憶體、也不讓程式崩潰。它利用一個
+    微架構事實 —— CPU 快取命中遠快於 DRAM 未命中 —— 純靠時間差推斷資料。這就是
+    Spectre / Meltdown 核心的 Flush+Reload 原語。
+
+    運作方式:
+      1. Flush  —— 把探測陣列逐出快取(讓每個槽都落在 DRAM)。
+      2. Victim —— 受害程式存取 probe[secret];於是只有該槽進入快取。
+      3. Reload —— 攻擊者逐槽計時;最快(快取命中)的那個就揭露了 secret。
+                  全程沒有讀取任何秘密位元組。
+
+    於 Apple Silicon 原生實測(本專案):
+      命中(L1/L2 快取)約  0.9 奈秒 / 存取
+      未命中(DRAM)   約 81   奈秒 / 存取   (約 90 倍)
+      -> 每次都正確還原秘密索引,且讀取 0 bytes 敏感記憶體。
+
+    實作要點:此處使用者層計時器很粗(~41.67 奈秒/tick)且無 cycle counter,所以
+    每次量測都是對「相依指標追逐」做批次計時,以攤平粒度並擊敗預取。必須先觸碰一個
+    大型逐出緩衝區(否則零頁 COW 會導致逐不出任何東西)。快取計時在模擬(Rosetta/
+    QEMU)下不成立,必須原生執行。
+
+    啟示:偷資料不一定要破壞記憶體 —— CPU 微架構本身就是攻擊面。
+
+-------------------------------------------------------------------------------
+11. SAFETY NOTE / 安全提醒
+-------------------------------------------------------------------------------
+EN: Run everything only inside the provided Docker sandbox. Never expose this
+    deliberately vulnerable server on a real network or a public port. This is
+    a teaching example that demonstrates a crash - it contains no exploit code.
+
+ZH: 一切只在提供的 Docker 沙箱內執行。切勿把這支刻意脆弱的伺服器暴露到真實網路或
+    公開 Port。這是示範「崩潰」的教學範例,不含任何攻擊 (exploit) 程式碼。
+===============================================================================
